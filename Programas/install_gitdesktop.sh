@@ -1311,29 +1311,33 @@ delete_folder_secondary_branch() {
   printf 'quando todos os arquivos são removidos.\n'
 }
 rename_folder_secondary_branch() {
-  local branch_name old_folder new_folder repo_encoded branch_ref_encoded branch_sha commit_tree_sha tree_status
-  local old_prefix new_prefix confirm payload new_tree_sha new_commit_sha update_status
+  # Opção 28: renomear qualquer pasta (MAIN ou branch secundária).
+  local repo branch_name old_folder new_folder repo_encoded branch_ref_encoded
+  local branch_sha commit_tree_sha tree_status old_prefix new_prefix confirm
+  local payload new_tree_sha new_commit_sha update_status default_branch
   ensure_login || return 1
-  select_repository || return 1
-  printf 'Nome da BRANCH secundária: '
-  gui_read branch_name
-  [ -n "$branch_name" ] || {
-    printf 'Nome de branch inválido.\n'
-    return 1
-  }
-  if [ "$branch_name" = "$DEFAULT_BRANCH" ]; then
-    printf 'Operação bloqueada: renomeie pastas somente em uma BRANCH secundária.\n'
+  printf '\n=== RENOMEAR PASTA ===\n'
+  printf 'Nome do repositório: '
+  gui_read repo
+  valid_name "$repo" || { printf 'Nome de repositório inválido.\n'; return 1; }
+  repo_encoded=$(urlencode "$repo") || return 1
+  if ! api GET "/repos/$GITHUB_USER/$repo_encoded" "" "$TMP_DIR/rename-folder-repo.json"; then
     return 1
   fi
-  repo_encoded=$(urlencode "$SELECTED_REPO") || return 1
+  default_branch=$(jq -r '.default_branch // "main"' "$TMP_DIR/rename-folder-repo.json")
+  SELECTED_REPO="$repo"
+  DEFAULT_BRANCH="$default_branch"
+  printf 'Branch (ENTER para MAIN = %s): ' "$default_branch"
+  gui_read branch_name
+  [ -n "$branch_name" ] || branch_name="$default_branch"
   branch_ref_encoded=$(urlencode_path "$branch_name") || return 1
   if ! api GET "/repos/$GITHUB_USER/$repo_encoded/git/ref/heads/$branch_ref_encoded" "" "$TMP_DIR/rename-folder-branch-ref.json"; then
-    printf 'A BRANCH secundária não foi localizada.\n'
+    printf 'A branch não foi localizada: %s\n' "$branch_name"
     return 1
   fi
   branch_sha=$(jq -r '.object.sha // empty' "$TMP_DIR/rename-folder-branch-ref.json")
   [ -n "$branch_sha" ] || {
-    printf 'Não foi possível obter o commit da BRANCH.\n'
+    printf 'Não foi possível obter o commit da branch.\n'
     return 1
   }
   printf 'Caminho atual da pasta: '
@@ -1361,7 +1365,7 @@ rename_folder_secondary_branch() {
   fi
   commit_tree_sha=$(jq -r '.tree.sha // empty' "$TMP_DIR/rename-folder-commit.json")
   [ -n "$commit_tree_sha" ] || {
-    printf 'Não foi possível obter a árvore da BRANCH.\n'
+    printf 'Não foi possível obter a árvore da branch.\n'
     return 1
   }
   tree_status=$(curl -sS -o "$TMP_DIR/rename-folder-tree.json" -w '%{http_code}' \
@@ -1369,7 +1373,7 @@ rename_folder_secondary_branch() {
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "X-GitHub-Api-Version: $API_VERSION" \
     "$API_URL/repos/$GITHUB_USER/$repo_encoded/git/trees/$commit_tree_sha?recursive=1") || {
-    printf 'Falha ao consultar a árvore da BRANCH.\n'
+    printf 'Falha ao consultar a árvore da branch.\n'
     return 1
   }
   [ "$tree_status" = 200 ] || {
@@ -1378,8 +1382,7 @@ rename_folder_secondary_branch() {
     return 1
   }
   if [ "$(jq -r '.truncated // false' "$TMP_DIR/rename-folder-tree.json")" = true ]; then
-    printf 'A árvore do repositório foi truncada pela API. Renomeação cancelada para evitar\n'
-    printf 'alterações incompletas.\n'
+    printf 'A árvore do repositório foi truncada pela API. Renomeação cancelada para evitar alterações incompletas.\n'
     return 1
   fi
   if ! jq -e --arg prefix "$old_prefix" '.tree[]? | select(.type == "blob" and (.path | startswith($prefix)))' \
@@ -1393,10 +1396,10 @@ rename_folder_secondary_branch() {
     printf 'O destino já existe: %s. Renomeação cancelada para evitar sobrescrita.\n' "$new_folder"
     return 1
   fi
-  printf '\nRepositório     : %s\n' "$SELECTED_REPO"
-  printf 'BRANCH secundária: %s\n' "$branch_name"
-  printf 'Pasta atual     : %s\n' "$old_folder"
-  printf 'Novo caminho    : %s\n' "$new_folder"
+  printf '\nRepositório : %s\n' "$repo"
+  printf 'Branch      : %s\n' "$branch_name"
+  printf 'Pasta atual : %s\n' "$old_folder"
+  printf 'Novo caminho: %s\n' "$new_folder"
   printf 'Arquivos que serão movidos:\n'
   jq -r --arg prefix "$old_prefix" '.tree[]? | select(.type == "blob" and (.path | startswith($prefix))) | .path' \
     "$TMP_DIR/rename-folder-tree.json"
@@ -1418,7 +1421,7 @@ rename_folder_secondary_branch() {
     return 1
   }
   if ! api POST "/repos/$GITHUB_USER/$repo_encoded/git/trees" "$payload" "$TMP_DIR/rename-folder-new-tree.json"; then
-    printf 'Não foi possível criar a nova árvore. A BRANCH não foi alterada.\n'
+    printf 'Não foi possível criar a nova árvore. A branch não foi alterada.\n'
     return 1
   fi
   new_tree_sha=$(jq -r '.sha // empty' "$TMP_DIR/rename-folder-new-tree.json")
@@ -1432,7 +1435,7 @@ rename_folder_secondary_branch() {
     --arg parent "$branch_sha" \
     '{message:$message,tree:$tree,parents:[$parent]}') || return 1
   if ! api POST "/repos/$GITHUB_USER/$repo_encoded/git/commits" "$payload" "$TMP_DIR/rename-folder-new-commit.json"; then
-    printf 'Não foi possível criar o commit. A BRANCH não foi alterada.\n'
+    printf 'Não foi possível criar o commit. A branch não foi alterada.\n'
     return 1
   fi
   new_commit_sha=$(jq -r '.sha // empty' "$TMP_DIR/rename-folder-new-commit.json")
@@ -1449,22 +1452,24 @@ rename_folder_secondary_branch() {
     -H 'Content-Type: application/json' \
     --data-binary "$payload" \
     "$API_URL/repos/$GITHUB_USER/$repo_encoded/git/refs/heads/$branch_ref_encoded") || {
-    printf 'Falha de comunicação ao atualizar a BRANCH.\n'
+    printf 'Falha de comunicação ao atualizar a branch.\n'
     return 1
   }
   case "$update_status" in
     200)
-      printf 'Pasta renomeada com sucesso: %s -> %s (BRANCH: %s)\n' "$old_folder" "$new_folder" "$branch_name"
+      printf 'Pasta renomeada com sucesso: %s -> %s (branch: %s)\n' "$old_folder" "$new_folder" "$branch_name"
       printf 'Os arquivos e subpastas foram preservados no novo caminho.\n'
+      audit_log "RENAME_FOLDER" "$repo/$branch_name: $old_folder -> $new_folder"
       ;;
     *)
-      printf 'Falha ao atualizar a BRANCH (HTTP %s). A árvore e o commit foram preparados,\n' "$update_status"
-      printf 'mas a BRANCH não foi atualizada.\n'
+      printf 'Falha ao atualizar a branch (HTTP %s). A árvore e o commit foram preparados,\n' "$update_status"
+      printf 'mas a branch não foi atualizada.\n'
       jq -r '.message // empty' "$TMP_DIR/rename-folder-update-ref.json" 2>/dev/null
       return 1
       ;;
   esac
 }
+
 compare_local_remote_file() {
   local file local_path local_date page count repo default_branch branch path
   local match_count selected_repo selected_branch selected_path encoded_repo encoded_path
