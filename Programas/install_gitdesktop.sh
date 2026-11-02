@@ -624,19 +624,57 @@ download_file() {
   printf '\nArquivo copiado com segurança para: %s\n' "$output"
 }
 delete_remote_file() {
-  local branch path message sha payload answer encoded_path repo_encoded
-  select_repository || return 1
-  printf 'Branch: '
+  local repo branch folder file_name path message sha payload answer
+  local repo_encoded encoded_path candidate matched_path
+  ensure_login || return 1
+  printf '\n=== EXCLUIR ARQUIVO REMOTO ===\n'
+  printf 'Nome do repositório: '
+  gui_read repo
+  valid_name "$repo" || { printf 'Nome de repositório inválido.\n'; return 1; }
+  repo_encoded=$(urlencode "$repo") || return 1
+  if ! api GET "/repos/$GITHUB_USER/$repo_encoded" "" "$TMP_DIR/del-file-repo.json"; then
+    return 1
+  fi
+  DEFAULT_BRANCH=$(jq -r '.default_branch // "main"' "$TMP_DIR/del-file-repo.json")
+  SELECTED_REPO="$repo"
+  printf 'Branch (ENTER para MAIN = %s): ' "$DEFAULT_BRANCH"
   gui_read branch
   [ -n "$branch" ] || branch="$DEFAULT_BRANCH"
-  printf 'Caminho do arquivo remoto: '
-  gui_read path
-  [ -n "$path" ] || {
-    printf 'Caminho inválido.\n'
+  if ! api GET "/repos/$GITHUB_USER/$repo_encoded/branches/$(urlencode "$branch")" "" "$TMP_DIR/del-file-branch.json"; then
+    printf 'Branch não encontrada ou inacessível: %s\n' "$branch"
     return 1
-  }
+  fi
+  printf 'Pasta (ENTER para RAIZ): '
+  gui_read folder
+  folder=${folder#/}; folder=${folder%/}
+  if [ -n "$folder" ]; then
+    validate_remote_folder "$folder" || { printf 'Caminho de pasta inválido.\n'; return 1; }
+  fi
+  remote_file_paths "$repo" "$branch" "$folder" || return 1
+  if [ ! -s "$TMP_DIR/remote-files-paths.txt" ]; then
+    printf 'Nenhum arquivo encontrado nessa pasta/branch.\n'
+    return 1
+  fi
+  printf '\nArquivos existentes na pasta "%s" (branch %s):\n' "${folder:-/}" "$branch"
+  cat "$TMP_DIR/remote-files-paths.txt"
+  printf '\nNome do arquivo a excluir (com extensão, sem caminho): '
+  gui_read file_name
+  [ -n "$file_name" ] || { printf 'Nome de arquivo não informado.\n'; return 1; }
+  case "$file_name" in */*|*\\*) printf 'Informe somente o nome do arquivo, sem caminhos.\n'; return 1 ;; esac
+  matched_path=""
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if [ "${candidate##*/}" = "$file_name" ]; then
+      matched_path="$candidate"
+      break
+    fi
+  done < "$TMP_DIR/remote-files-paths.txt"
+  if [ -z "$matched_path" ]; then
+    printf 'Arquivo "%s" não encontrado na pasta informada.\n' "$file_name"
+    return 1
+  fi
+  path="$matched_path"
   encoded_path=$(urlencode_path "$path") || return 1
-  repo_encoded=$(urlencode "$SELECTED_REPO") || return 1
   if ! api GET \
     "/repos/$GITHUB_USER/$repo_encoded/contents/$encoded_path?ref=$(urlencode "$branch")" \
     "" "$TMP_DIR/content.json"; then
@@ -649,8 +687,11 @@ delete_remote_file() {
   }
   printf 'Mensagem do commit de exclusão: '
   gui_read message
-  [ -n "$message" ] || message="Exclusão via GitHub Manager"
-  printf 'Confirma a exclusão de %s? (s/n): ' "$path"
+  [ -n "$message" ] || message="Exclusão de $path via GitHub Manager"
+  printf '\nRepositório : %s\n' "$repo"
+  printf 'Branch      : %s\n' "$branch"
+  printf 'Arquivo     : %s\n' "$path"
+  printf 'Confirma a exclusão? (s/n): '
   gui_read answer
   case "$answer" in
     s|S|sim|SIM) ;;
@@ -662,9 +703,10 @@ delete_remote_file() {
     --arg branch "$branch" \
     '{message:$message,sha:$sha,branch:$branch}')
   if api DELETE \
-    "/repos/$GITHUB_USER/$(urlencode "$SELECTED_REPO")/contents/$encoded_path" \
+    "/repos/$GITHUB_USER/$repo_encoded/contents/$encoded_path" \
     "$payload"; then
-    printf 'Arquivo excluído.\n'
+    printf 'Arquivo excluído: %s\n' "$path"
+    audit_log "DELETE_FILE" "$repo/$branch/$path"
   fi
 }
 urlencode_path() {
@@ -2058,6 +2100,290 @@ move_all_repository_folder_files() { move_all_files_bulk "folder"; }
 move_all_main_branch_files() { move_all_files_bulk "main"; }
 move_all_secondary_branch_files() { move_all_files_bulk "secondary"; }
 
+# Opção 18: enviar (copiar) UM arquivo da MAIN de qualquer pasta para outro repositório/pasta.
+upload_local_file_to_github() {
+  local local_folder file_name dest_repo dest_branch dest_folder
+  local local_path remote_path repo_encoded path_encoded
+  local http_code sha status answer fsize resolved_dir
+  ensure_login || return 1
+  command -v base64 >/dev/null 2>&1 || { printf 'Erro: base64 não está disponível.\n'; return 1; }
+  printf '\n=== ENVIAR ARQUIVO LOCAL AO GITHUB ===\n'
+  printf 'Pasta local de ORIGEM (ENTER = diretório configurado): '
+  gui_read local_folder
+  if [ -z "$local_folder" ]; then
+    resolved_dir="$(get_local_base_dir)" || return 1
+  else
+    case "$local_folder" in
+      '~') local_folder="$HOME" ;;
+      '~/'*) local_folder="$HOME/${local_folder#\~/}" ;;
+      /*) ;;
+      *) local_folder="$(get_local_base_dir)/$local_folder" ;;
+    esac
+    [ -d "$local_folder" ] || { printf 'Pasta local não encontrada: %s\n' "$local_folder"; return 1; }
+    resolved_dir="$(cd -- "$local_folder" 2>/dev/null && pwd -P)" || {
+      printf 'Não foi possível acessar a pasta local.\n'; return 1
+    }
+  fi
+  printf 'Pasta local: %s\n' "$resolved_dir"
+  printf 'Arquivos locais:\n'
+  find "$resolved_dir" -maxdepth 1 -type f -printf '  %f\n' 2>/dev/null | sort || true
+  printf 'Nome do arquivo local (com extensão, sem caminho): '
+  gui_read file_name
+  case "$file_name" in ""|"."|".."|*/*|*\\*) printf 'Informe somente o nome do arquivo, sem caminhos.\n'; return 1 ;; esac
+  local_path="$resolved_dir/$file_name"
+  [[ -f "$local_path" && ! -L "$local_path" ]] || { printf 'Arquivo não encontrado: %s\n' "$local_path"; return 1; }
+  [ -r "$local_path" ] || { printf 'Sem permissão de leitura: %s\n' "$local_path"; return 1; }
+  fsize=$(wc -c < "$local_path" 2>/dev/null || echo 0)
+  if [ "$fsize" -gt 52428800 ]; then
+    printf 'AVISO: arquivo com %s bytes. A API Contents não é ideal acima de 50 MB.\n' "$fsize"
+  fi
+  if [ "$fsize" -gt 104857600 ]; then
+    printf 'Erro: arquivo acima de 100 MB. Use git commit/push ou Git LFS.\n'
+    return 1
+  fi
+  printf 'Repositório de DESTINO: '
+  gui_read dest_repo
+  valid_name "$dest_repo" || { printf 'Nome de repositório inválido.\n'; return 1; }
+  repo_encoded=$(urlencode "$dest_repo") || return 1
+  if ! api GET "/repos/$GITHUB_USER/$repo_encoded" "" "$TMP_DIR/up-local-repo.json"; then return 1; fi
+  DEFAULT_BRANCH=$(jq -r '.default_branch // "main"' "$TMP_DIR/up-local-repo.json")
+  printf 'Branch de DESTINO (ENTER = MAIN = %s): ' "$DEFAULT_BRANCH"
+  gui_read dest_branch
+  [ -n "$dest_branch" ] || dest_branch="$DEFAULT_BRANCH"
+  if ! api GET "/repos/$GITHUB_USER/$repo_encoded/branches/$(urlencode "$dest_branch")" "" "$TMP_DIR/up-local-branch.json"; then
+    printf 'Branch de destino não encontrada: %s\n' "$dest_branch"
+    return 1
+  fi
+  printf 'Pasta de DESTINO no GitHub (ENTER para RAIZ): '
+  gui_read dest_folder
+  dest_folder=${dest_folder#/}; dest_folder=${dest_folder%/}
+  if [ -n "$dest_folder" ]; then
+    validate_remote_folder "$dest_folder" || { printf 'Pasta de destino inválida.\n'; return 1; }
+    remote_path="$dest_folder/$file_name"
+  else
+    remote_path="$file_name"
+  fi
+  printf '\nLocal   : %s\n' "$local_path"
+  printf 'Destino : %s / %s / %s\n' "$dest_repo" "$dest_branch" "$remote_path"
+  printf 'Confirma o envio? (s/n): '
+  gui_read answer
+  case "$answer" in s|S|sim|SIM) ;; *) printf 'Operação cancelada.\n'; return 0 ;; esac
+  if ! base64 < "$local_path" | tr -d '\r\n' > "$TMP_DIR/upload-content.b64"; then
+    printf 'Erro ao codificar o arquivo.\n'; return 1
+  fi
+  path_encoded=$(urlencode_path "$remote_path") || return 1
+  http_code=$(curl -sS -o "$TMP_DIR/content.json" -w '%{http_code}' \
+    -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "X-GitHub-Api-Version: $API_VERSION" \
+    "$API_URL/repos/$GITHUB_USER/$repo_encoded/contents/$path_encoded?ref=$(urlencode "$dest_branch")") || http_code=000
+  sha=""
+  case "$http_code" in
+    200)
+      sha=$(jq -r '.sha // empty' "$TMP_DIR/content.json")
+      printf 'O arquivo remoto já existe. Atualizar? (s/n): '
+      gui_read answer
+      case "$answer" in s|S|sim|SIM) ;; *) printf 'Remoto mantido. Envio cancelado.\n'; return 0 ;; esac
+      [ -n "$sha" ] || { printf 'SHA remoto indisponível.\n'; return 1; }
+      ;;
+    404) ;;
+    *) printf 'Erro ao consultar remoto (HTTP %s).\n' "$http_code"; jq -r '.message // empty' "$TMP_DIR/content.json" 2>/dev/null; return 1 ;;
+  esac
+  if ! jq -n --arg message "Envio de $remote_path via GitHub Manager" \
+    --rawfile content "$TMP_DIR/upload-content.b64" --arg branch "$dest_branch" --arg sha "$sha" \
+    '{message:$message,content:($content|gsub("[\\r\\n]";"")),branch:$branch} + (if $sha != "" then {sha:$sha} else {} end)' \
+    > "$TMP_DIR/upload-payload.json"; then
+    printf 'Erro ao preparar o envio.\n'; return 1
+  fi
+  status=$(curl -sS -o "$TMP_DIR/upload.json" -w '%{http_code}' -X PUT \
+    -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "X-GitHub-Api-Version: $API_VERSION" -H 'Content-Type: application/json' \
+    --data-binary "@$TMP_DIR/upload-payload.json" \
+    "$API_URL/repos/$GITHUB_USER/$repo_encoded/contents/$path_encoded") || status=000
+  case "$status" in
+    200|201)
+      if jq -e '.content.sha and .commit.sha' "$TMP_DIR/upload.json" >/dev/null 2>&1; then
+        printf 'Arquivo enviado com sucesso: %s -> %s/%s/%s\n' "$file_name" "$dest_repo" "$dest_branch" "$remote_path"
+      else
+        printf 'A API não confirmou o envio.\n'
+        jq -r '.message // empty' "$TMP_DIR/upload.json" 2>/dev/null
+        return 1
+      fi
+      ;;
+    *)
+      printf 'Falha no envio (HTTP %s).\n' "$status"
+      jq -r '.message // empty' "$TMP_DIR/upload.json" 2>/dev/null
+      return 1
+      ;;
+  esac
+}
+
+
+move_all_branch_flexible() {
+  local src_repo src_branch src_folder dest_mode dest_repo dest_branch dest_folder
+  local src_repo_enc dest_repo_enc src_branch_enc dest_branch_enc
+  local source_path base_name destination_path source_encoded destination_encoded
+  local source_status source_sha target_status payload status total moved failed answer i
+  local -a paths=() destinations=()
+  ensure_login || return 1
+  printf '\n=== MOVER TODOS OS ARQUIVOS DA BRANCH ===\n'
+  printf 'Repositório de ORIGEM: '
+  gui_read src_repo
+  valid_name "$src_repo" || { printf 'Nome de repositório inválido.\n'; return 1; }
+  src_repo_enc=$(urlencode "$src_repo") || return 1
+  if ! api GET "/repos/$GITHUB_USER/$src_repo_enc" "" "$TMP_DIR/flex-src-repo.json"; then return 1; fi
+  printf 'Branch de ORIGEM (ex.: main ou nome da secundária): '
+  gui_read src_branch
+  [ -n "$src_branch" ] || { printf 'Branch de origem não informada.\n'; return 1; }
+  if ! api GET "/repos/$GITHUB_USER/$src_repo_enc/branches/$(urlencode "$src_branch")" "" "$TMP_DIR/flex-src-branch.json"; then
+    printf 'Branch de origem não encontrada.\n'; return 1
+  fi
+  printf 'Pasta de ORIGEM (ENTER para RAIZ): '
+  gui_read src_folder
+  src_folder=${src_folder#/}; src_folder=${src_folder%/}
+  if [ -n "$src_folder" ]; then
+    validate_remote_folder "$src_folder" || { printf 'Pasta de origem inválida.\n'; return 1; }
+  fi
+  printf '\nTipo de DESTINO:\n'
+  printf '  R = outro REPOSITÓRIO (e pasta)\n'
+  printf '  B = BRANCH secundária (mesmo ou outro fluxo de pasta)\n'
+  printf 'Escolha (R/B): '
+  gui_read dest_mode
+  case "$dest_mode" in
+    r|R|repo|REPOSITORIO|repositório|REPOSITÓRIO)
+      dest_mode=repo
+      printf 'Repositório de DESTINO: '
+      gui_read dest_repo
+      valid_name "$dest_repo" || { printf 'Nome de repositório de destino inválido.\n'; return 1; }
+      dest_repo_enc=$(urlencode "$dest_repo") || return 1
+      if ! api GET "/repos/$GITHUB_USER/$dest_repo_enc" "" "$TMP_DIR/flex-dest-repo.json"; then return 1; fi
+      dest_branch=$(jq -r '.default_branch // "main"' "$TMP_DIR/flex-dest-repo.json")
+      printf 'Usando MAIN do destino: %s\n' "$dest_branch"
+      ;;
+    b|B|branch|BRANCH)
+      dest_mode=branch
+      dest_repo="$src_repo"
+      dest_repo_enc="$src_repo_enc"
+      printf 'Nome da BRANCH secundária de DESTINO: '
+      gui_read dest_branch
+      [ -n "$dest_branch" ] || { printf 'Branch de destino não informada.\n'; return 1; }
+      local src_default
+      src_default=$(jq -r '.default_branch // "main"' "$TMP_DIR/flex-src-repo.json")
+      if [ "$dest_branch" = "$src_default" ]; then
+        printf 'Informe uma BRANCH secundária, não a MAIN (%s).\n' "$src_default"
+        return 1
+      fi
+      if ! api GET "/repos/$GITHUB_USER/$dest_repo_enc/branches/$(urlencode "$dest_branch")" "" "$TMP_DIR/flex-dest-branch.json"; then
+        printf 'Branch secundária de destino não encontrada.\n'; return 1
+      fi
+      ;;
+    *)
+      printf 'Opção de destino inválida. Use R ou B.\n'
+      return 1
+      ;;
+  esac
+  printf 'Pasta de DESTINO (ENTER para RAIZ): '
+  gui_read dest_folder
+  dest_folder=${dest_folder#/}; dest_folder=${dest_folder%/}
+  if [ -n "$dest_folder" ]; then
+    validate_remote_folder "$dest_folder" || { printf 'Pasta de destino inválida.\n'; return 1; }
+  fi
+  if [ "$src_repo" = "$dest_repo" ] && [ "$src_branch" = "$dest_branch" ]; then
+    if [ "${src_folder:-}" = "${dest_folder:-}" ]; then
+      printf 'Origem e destino são idênticos. Nada a mover.\n'
+      return 0
+    fi
+  fi
+  remote_file_paths "$src_repo" "$src_branch" "$src_folder" || return 1
+  if [ "$(jq -r '.truncated // false' "$TMP_DIR/remote-files-tree.json")" = "true" ]; then
+    printf 'A árvore do GitHub veio truncada. Operação cancelada.\n'
+    return 1
+  fi
+  while IFS= read -r source_path; do
+    [ -n "$source_path" ] || continue
+    base_name=${source_path##*/}
+    if [ -n "$dest_folder" ]; then destination_path="$dest_folder/$base_name"; else destination_path="$base_name"; fi
+    if [ "$src_repo" = "$dest_repo" ] && [ "$src_branch" = "$dest_branch" ] && [ "$source_path" = "$destination_path" ]; then
+      continue
+    fi
+    paths+=("$source_path")
+    destinations+=("$destination_path")
+  done < "$TMP_DIR/remote-files-paths.txt"
+  total=${#paths[@]}
+  if [ "$total" -eq 0 ]; then printf 'Nenhum arquivo elegível encontrado.\n'; return 0; fi
+  local -A seen_dest=()
+  for destination_path in "${destinations[@]}"; do
+    if [[ -n "${seen_dest[$destination_path]+x}" ]]; then
+      printf 'Colisão de nomes no destino: "%s". Nenhuma alteração feita.\n' "$destination_path"
+      return 1
+    fi
+    seen_dest[$destination_path]=1
+  done
+  # Pré-valida destinos
+  for destination_path in "${destinations[@]}"; do
+    destination_encoded=$(urlencode_path "$destination_path") || return 1
+    target_status=$(curl -sS -o "$TMP_DIR/flex-preflight.json" -w '%{http_code}' \
+      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "X-GitHub-Api-Version: $API_VERSION" \
+      "$API_URL/repos/$GITHUB_USER/$dest_repo_enc/contents/$destination_encoded?ref=$(urlencode "$dest_branch")") || target_status=000
+    case "$target_status" in
+      404) ;;
+      200) printf 'Destino já existe: %s. Escolha outra pasta. Nenhuma alteração feita.\n' "$destination_path"; return 1 ;;
+      *) printf 'Não foi possível validar destino %s (HTTP %s). Nenhuma alteração feita.\n' "$destination_path" "$target_status"; return 1 ;;
+    esac
+  done
+  printf '\nOrigem : %s / %s / %s\n' "$src_repo" "$src_branch" "${src_folder:-/}"
+  printf 'Destino: %s / %s / %s\n' "$dest_repo" "$dest_branch" "${dest_folder:-/}"
+  printf 'Arquivos: %s\n' "$total"
+  printf '\nPrévia:\n'
+  for ((i=0; i<total; i++)); do printf '  %s  ->  %s\n' "${paths[$i]}" "${destinations[$i]}"; done
+  printf '\nConfirma MOVER TODOS os arquivos listados? (s/n): '
+  gui_read answer
+  case "$answer" in s|S|sim|SIM) ;; *) printf 'Operação cancelada.\n'; return 0 ;; esac
+  src_branch_enc=$(urlencode "$src_branch") || return 1
+  dest_branch_enc=$(urlencode "$dest_branch") || return 1
+  moved=0; failed=0
+  for ((i=0; i<total; i++)); do
+    source_path=${paths[$i]}; destination_path=${destinations[$i]}
+    source_encoded=$(urlencode_path "$source_path") || { failed=$((failed+1)); continue; }
+    destination_encoded=$(urlencode_path "$destination_path") || { failed=$((failed+1)); continue; }
+    source_status=$(curl -sS -o "$TMP_DIR/flex-source.json" -w '%{http_code}' \
+      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "X-GitHub-Api-Version: $API_VERSION" \
+      "$API_URL/repos/$GITHUB_USER/$src_repo_enc/contents/$source_encoded?ref=$src_branch_enc") || source_status=000
+    if [ "$source_status" != 200 ]; then printf '[FALHA] Leitura %s (HTTP %s)\n' "$source_path" "$source_status"; failed=$((failed+1)); continue; fi
+    source_sha=$(jq -r '.sha // empty' "$TMP_DIR/flex-source.json")
+    if [ -z "$source_sha" ] || ! jq -e '.content and (.encoding == "base64")' "$TMP_DIR/flex-source.json" >/dev/null 2>&1; then
+      printf '[FALHA] Conteúdo indisponível (possível arquivo grande): %s\n' "$source_path"; failed=$((failed+1)); continue
+    fi
+    jq -r '.content' "$TMP_DIR/flex-source.json" | tr -d '\r\n' > "$TMP_DIR/flex-content.b64" || { failed=$((failed+1)); continue; }
+    if ! jq -n --arg message "Mover $source_path para $destination_path" --rawfile content "$TMP_DIR/flex-content.b64" --arg branch "$dest_branch" \
+      '{message:$message,content:$content,branch:$branch}' > "$TMP_DIR/flex-upload.json"; then failed=$((failed+1)); continue; fi
+    status=$(curl -sS -o "$TMP_DIR/flex-upload-result.json" -w '%{http_code}' -X PUT \
+      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "X-GitHub-Api-Version: $API_VERSION" -H 'Content-Type: application/json' \
+      --data-binary "@$TMP_DIR/flex-upload.json" \
+      "$API_URL/repos/$GITHUB_USER/$dest_repo_enc/contents/$destination_encoded") || status=000
+    case "$status" in 200|201) ;; *) printf '[FALHA] Upload %s (HTTP %s); origem preservada.\n' "$destination_path" "$status"; failed=$((failed+1)); continue ;; esac
+    payload=$(jq -n --arg message "Remover origem após mover para $destination_path" --arg sha "$source_sha" --arg branch "$src_branch" \
+      '{message:$message,sha:$sha,branch:$branch}') || { printf '[ATENÇÃO] Destino gravado; falha ao preparar remoção de %s.\n' "$source_path"; failed=$((failed+1)); continue; }
+    status=$(curl -sS -o "$TMP_DIR/flex-delete-result.json" -w '%{http_code}' -X DELETE \
+      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "X-GitHub-Api-Version: $API_VERSION" -H 'Content-Type: application/json' \
+      --data-binary "$payload" \
+      "$API_URL/repos/$GITHUB_USER/$src_repo_enc/contents/$source_encoded") || status=000
+    if [ "$status" = 200 ] || [ "$status" = 204 ]; then
+      printf '[OK] %s -> %s/%s/%s\n' "$source_path" "$dest_repo" "$dest_branch" "$destination_path"
+      moved=$((moved+1))
+    else
+      printf '[ATENÇÃO] Destino gravado, origem não removida: %s (HTTP %s)\n' "$source_path" "$status"
+      failed=$((failed+1))
+    fi
+  done
+  printf '\nRESUMO: %s movido(s), %s com falha/ignorados, de %s arquivo(s).\n' "$moved" "$failed" "$total"
+  [ "$failed" -eq 0 ]
+}
+
+
 GUI_LOG="$TMP_DIR/gui.log"
 cleanup_gui() { cleanup 2>/dev/null || :; }
 trap cleanup_gui EXIT
@@ -2144,7 +2470,7 @@ run_task() {
     3) fn=move_secondary_branch_files;;
     4) fn=move_all_repository_folder_files;;
     5) fn=move_all_main_branch_files;;
-    6) fn=move_all_secondary_branch_files;;
+    6) fn=move_all_branch_flexible;;
     7) fn=list_repositories;;
     8) fn=search_file;;
     9) fn=list_local_files;;
@@ -2156,7 +2482,7 @@ run_task() {
     15) fn=delete_folder_secondary_branch;;
     16) fn=delete_remote_file;;
     17) fn=download_file;;
-    18) fn=upload_file;;
+    18) fn=upload_local_file_to_github;;
     19) fn=clone_third_party_repository;;
     20|21) fn=upload_selected_attachments;;
     22) fn=create_repository_main;;
